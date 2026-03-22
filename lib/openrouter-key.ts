@@ -1,4 +1,5 @@
 import { mkdir, readFile, writeFile } from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 
 import { getOpenRouterHeaders, getServerConfig, KEY_ROTATION_MS } from "@/lib/env";
@@ -11,12 +12,42 @@ type RuntimeKeyState = {
   source: "static" | "managed";
 };
 
-const runtimeStatePath = path.join(process.cwd(), ".runtime", "openrouter-key.json");
+function getRuntimeStatePath() {
+  const customPath = process.env.OPENROUTER_RUNTIME_STATE_PATH?.trim();
+
+  if (customPath) {
+    return customPath;
+  }
+
+  const customDir = process.env.OPENROUTER_RUNTIME_DIR?.trim();
+
+  if (customDir) {
+    return path.join(customDir, "openrouter-key.json");
+  }
+
+  if (process.env.VERCEL || process.env.LAMBDA_TASK_ROOT) {
+    return path.join(os.tmpdir(), "scout-query", "openrouter-key.json");
+  }
+
+  return path.join(process.cwd(), ".runtime", "openrouter-key.json");
+}
+
+const runtimeStatePath = getRuntimeStatePath();
 
 let rotationPromise: Promise<RuntimeKeyState> | null = null;
+let memoryState: RuntimeKeyState | null = null;
 
 function getNowIso() {
   return new Date().toISOString();
+}
+
+function isRecoverableStorageError(error: unknown) {
+  if (!error || typeof error !== "object" || !("code" in error)) {
+    return false;
+  }
+
+  const code = String(error.code);
+  return code === "EROFS" || code === "EPERM" || code === "EACCES";
 }
 
 async function ensureRuntimeDir() {
@@ -24,6 +55,10 @@ async function ensureRuntimeDir() {
 }
 
 async function readRuntimeState() {
+  if (memoryState) {
+    return memoryState;
+  }
+
   try {
     const raw = await readFile(runtimeStatePath, "utf8");
     const parsed = JSON.parse(raw) as Partial<RuntimeKeyState>;
@@ -32,21 +67,33 @@ async function readRuntimeState() {
       return null;
     }
 
-    return {
+    memoryState = {
       key: parsed.key,
       hash: typeof parsed.hash === "string" ? parsed.hash : "",
       createdAt: typeof parsed.createdAt === "string" ? parsed.createdAt : getNowIso(),
       rotatedAt: typeof parsed.rotatedAt === "string" ? parsed.rotatedAt : getNowIso(),
       source: parsed.source === "managed" ? "managed" : "static",
     } satisfies RuntimeKeyState;
+
+    return memoryState;
   } catch {
-    return null;
+    return memoryState;
   }
 }
 
 async function writeRuntimeState(state: RuntimeKeyState) {
-  await ensureRuntimeDir();
-  await writeFile(runtimeStatePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  memoryState = state;
+
+  try {
+    await ensureRuntimeDir();
+    await writeFile(runtimeStatePath, `${JSON.stringify(state, null, 2)}\n`, "utf8");
+  } catch (error) {
+    if (isRecoverableStorageError(error)) {
+      return;
+    }
+
+    throw error;
+  }
 }
 
 function shouldRotate(state: RuntimeKeyState | null) {
