@@ -140,6 +140,35 @@ async function getBootstrapState() {
   return state;
 }
 
+async function syncStaticRuntimeState(currentState: RuntimeKeyState | null) {
+  const config = getServerConfig();
+
+  if (!config.openRouterKey) {
+    throw new Error("OPENROUTER_API_KEY is required.");
+  }
+
+  if (
+    currentState &&
+    currentState.source === "static" &&
+    currentState.key === config.openRouterKey &&
+    currentState.hash === config.openRouterKeyHash
+  ) {
+    return currentState;
+  }
+
+  const nowIso = getNowIso();
+  const nextState: RuntimeKeyState = {
+    key: config.openRouterKey,
+    hash: config.openRouterKeyHash,
+    createdAt: currentState?.createdAt ?? nowIso,
+    rotatedAt: nowIso,
+    source: "static",
+  };
+
+  await writeRuntimeState(nextState);
+  return nextState;
+}
+
 async function rotateRuntimeKey(currentState: RuntimeKeyState | null) {
   const config = getServerConfig();
 
@@ -181,18 +210,21 @@ export async function getOpenRouterRuntimeKey() {
     throw new Error("Add OPENROUTER_API_KEY, or use OPENROUTER_MANAGEMENT_API_KEY with a bootstrap key.");
   }
 
-  const currentState = (await readRuntimeState()) ?? (config.openRouterKey ? await getBootstrapState() : null);
+  const currentState = await readRuntimeState();
 
   if (!config.openRouterManagementKey) {
-    return currentState?.key || config.openRouterKey;
+    const syncedState = await syncStaticRuntimeState(currentState);
+    return syncedState.key;
   }
 
-  if (currentState && !shouldRotate(currentState)) {
-    return currentState.key;
+  const effectiveState = currentState ?? (config.openRouterKey ? await getBootstrapState() : null);
+
+  if (effectiveState && !shouldRotate(effectiveState)) {
+    return effectiveState.key;
   }
 
   if (!rotationPromise) {
-    rotationPromise = rotateRuntimeKey(currentState).finally(() => {
+    rotationPromise = rotateRuntimeKey(effectiveState).finally(() => {
       rotationPromise = null;
     });
   }
@@ -205,8 +237,18 @@ export async function getOpenRouterRuntimeStatus() {
   const state = await readRuntimeState();
   const config = getServerConfig();
 
+  if (!config.openRouterManagementKey) {
+    return {
+      rotationEnabled: false,
+      rotatedAt: state?.source === "static" ? state.rotatedAt : null,
+      source: config.openRouterKey ? "static" : "missing",
+      nextRotationAt: null,
+      hasInitialHash: Boolean(config.openRouterKeyHash),
+    };
+  }
+
   return {
-    rotationEnabled: config.openRouterManagementKey.length > 0,
+    rotationEnabled: true,
     rotatedAt: state?.rotatedAt ?? null,
     source: state?.source ?? (config.openRouterKey ? "static" : "missing"),
     nextRotationAt: state?.rotatedAt ? new Date(new Date(state.rotatedAt).getTime() + KEY_ROTATION_MS).toISOString() : null,

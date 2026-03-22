@@ -178,7 +178,28 @@ function encodeEvent(event: string, payload: unknown) {
 
 async function readErrorText(response: Response) {
   try {
-    return await response.text();
+    const raw = await response.text();
+
+    try {
+      const parsed = JSON.parse(raw) as {
+        error?: {
+          message?: string;
+          code?: number | string;
+        };
+      };
+
+      if (parsed?.error?.message) {
+        if (response.status === 401) {
+          return `OpenRouter authentication failed: ${parsed.error.message} Check OPENROUTER_API_KEY in your deployment settings. If rotation is enabled, OPENROUTER_MANAGEMENT_API_KEY must be a separate management key, not the normal chat key.`;
+        }
+
+        return parsed.error.message;
+      }
+    } catch {
+      // Fall through to the raw body when the upstream payload is not JSON.
+    }
+
+    return raw;
   } catch {
     return `${response.status} ${response.statusText}`;
   }
